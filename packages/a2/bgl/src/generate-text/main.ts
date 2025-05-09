@@ -138,7 +138,8 @@ class GenerateText {
     const shouldAddFakeResult = this.chat && firstTurn;
     if (shouldAddTools) {
       inputs.body.tools = [...tools];
-      inputs.body.toolConfig = { functionCallingConfig: { mode: "ANY" } };
+      // Don't force it to use tools.
+      // inputs.body.toolConfig = { functionCallingConfig: { mode: "ANY" } };
     } else {
       if (shouldAddFakeResult) {
         this.addKeepChattingResult(contents);
@@ -154,6 +155,7 @@ class GenerateText {
     }
     const prompt = new GeminiPrompt(inputs, { toolManager });
     const result = await prompt.invoke();
+    console.log("generate-text gemini call result: ", result);
     if (!ok(result)) return result;
     const calledTools =
       prompt.calledTools || doneTool.invoked || keepChattingTool.invoked;

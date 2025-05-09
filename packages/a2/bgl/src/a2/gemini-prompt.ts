@@ -29,7 +29,7 @@ function textToJson(content: LLMContent): LLMContent {
         try {
           return { json: JSON.parse(part.text) };
         } catch (e) {
-          // fall through.
+          // Just return the original part if it's not valid JSON.
         }
       }
       return part;
@@ -66,6 +66,9 @@ export type GeminiPromptOptions = {
   validator?: ValidatorFunction;
   toolManager?: ToolManager;
 };
+
+const MAX_SEQUENTIAL_TOOL_CALLS = 15;
+
 class GeminiPrompt {
   readonly options: GeminiPromptOptions;
 
@@ -96,124 +99,195 @@ class GeminiPrompt {
     const args = a as Record<string, unknown>;
     const context = [...this.inputs.body.contents];
     const hasContext = "context" in args;
-    let contextArg = hasContext
-      ? {}
-      : {
-          context,
-        };
-    return {
-      ...contextArg,
-      ...Object.fromEntries(
-        Object.entries(args).map(([name, value]) => {
-          if (hasContext) {
-            value = addUserTurn(value as string, [
-              ...this.inputs.body.contents,
-            ]);
-          }
-          return [name, value];
-        })
-      ),
-    };
+    if (hasContext) {
+      const argContext = args.context as LLMContent[];
+      context.push(...argContext);
+    }
+    return { ...args, context };
   }
 
   async invoke(): Promise<Outcome<GeminiPromptOutput>> {
     this.calledTools = false;
     this.calledCustomTools = false;
-    const { allowToolErrors, validator } = this.options;
-    const invoking = await gemini(this.inputs);
-    if (!ok(invoking)) return invoking;
-    if ("context" in invoking) {
-      return err("Invalid output from Gemini -- must be candidates");
-    }
-    const candidate = invoking.candidates.at(0);
-    const content = candidate?.content;
-    if (!content) {
-      return err("No content from Gemini");
-    }
-    if (!content.parts) {
-      return err(
-        `Gemini failed to generate result due to ${candidate.finishReason}`
-      );
-    }
-    const results: LLMContent[][] = [];
-    const errors: string[] = [];
-    if (validator) {
-      const validating = validator(content);
-      if (!ok(validating)) return validating;
-    }
-    await this.options.toolManager?.processResponse(
-      content,
-      async ($board, args, passContext, functionName) => {
-        console.log("CALLING TOOL", $board, args, passContext);
-        this.calledTools = true;
-        if (passContext) {
-          // Passing context means we called a subgraph/'custom tool'.
-          this.calledCustomTools = true;
+    const { allowToolErrors, validator, toolManager } = this.options;
+
+    let currentApiContents: LLMContent[] = [...this.inputs.body.contents];
+    let lastCandidate: Candidate | undefined;
+    let finalModelResponseContent: LLMContent | undefined;
+    let loopIteration = 0;
+
+    for (
+      loopIteration = 0;
+      loopIteration < MAX_SEQUENTIAL_TOOL_CALLS;
+      loopIteration++
+    ) {
+      const currentGeminiInputs: GeminiInputs = {
+        ...this.inputs,
+        body: {
+          ...this.inputs.body,
+          contents: currentApiContents,
+        },
+      };
+
+      // console.log("Calling Gemini API, iteration:", loopIteration + 1, "with contents:", JSON.stringify(currentApiContents, null, 2));
+      const invoking = await gemini(currentGeminiInputs);
+
+      if (!ok(invoking)) {
+        console.error("Error from Gemini API:", invoking.$error);
+        return invoking;
+      }
+      if ("context" in invoking) {
+        return err(
+          "Invalid output from Gemini -- expected candidates, got context"
+        );
+      }
+
+      const candidate = invoking.candidates.at(0);
+      const modelResponsePart = candidate?.content;
+      lastCandidate = candidate;
+
+      if (!modelResponsePart) {
+        return err(
+          `No content from Gemini. Finish reason: ${candidate?.finishReason}`
+        );
+      }
+      if (!modelResponsePart.parts || modelResponsePart.parts.length === 0) {
+        if (candidate?.finishReason === "STOP") {
+          finalModelResponseContent = modelResponsePart;
+          // console.log("Gemini returned empty parts with STOP reason.");
+          break;
         }
-        const callingTool = await invokeBoard({
-          $board,
-          ...this.#normalizeArgs(args, passContext),
-        });
-        if ("$error" in callingTool) {
-          errors.push(JSON.stringify(callingTool.$error));
-        } else if (functionName === undefined) {
-          errors.push(`No function name for ${JSON.stringify(callingTool)}`);
-        } else {
-          if (passContext) {
-            if (!("context" in callingTool)) {
-              errors.push(`No "context" port in outputs of "${$board}"`);
-            } else {
-              const response = {
-                ["value"]: JSON.stringify(callingTool.context as LLMContent[]),
-              };
-              const responsePart: FunctionResponsePart = {
-                functionResponse: {
-                  name: functionName,
-                  response: response,
-                },
-              };
-              const toolResponseContent: LLMContent = {
-                role: "user",
-                parts: [responsePart],
-              };
-              results.push([toolResponseContent]);
-              console.log(
-                "gemini-prompt + passContext, processResponse: ",
-                results
-              );
+        return err(
+          `Gemini failed to generate result parts. Finish reason: ${candidate?.finishReason}`
+        );
+      }
+
+      currentApiContents = [...currentApiContents, modelResponsePart];
+      finalModelResponseContent = modelResponsePart;
+
+      const hasFunctionCall = modelResponsePart.parts.some(
+        (part) => "functionCall" in part
+      );
+
+      if (hasFunctionCall && toolManager) {
+        // console.log("Gemini response includes function call, processing with ToolManager.");
+        this.calledTools = true;
+        const turnToolResultsLLMContent: LLMContent[][] = [];
+        const turnToolErrors: string[] = [];
+
+        await toolManager.processResponse(
+          modelResponsePart,
+          async ($board, args, passContext, functionName) => {
+            // console.log("Executing tool via ToolManager:", functionName, "with args:", args);
+            this.calledTools = true;
+            if (passContext) {
+              this.calledCustomTools = true;
             }
-          } else {
-            const responsePart: FunctionResponsePart = {
-              functionResponse: {
-                name: functionName,
-                response: callingTool,
-              },
-            };
-            const toolResponseContent: LLMContent = {
-              role: "user",
-              parts: [responsePart],
-            };
-            console.log("toolResponseContent: ", toolResponseContent);
-            results.push([toolResponseContent]);
-            console.log("gemini-prompt processResponse: ", results);
+            const callingTool = await invokeBoard({
+              $board,
+              ...this.#normalizeArgs(args, passContext),
+            });
+
+            if ("$error" in callingTool) {
+              turnToolErrors.push(JSON.stringify(callingTool.$error));
+            } else if (functionName === undefined) {
+              turnToolErrors.push(
+                `No function name for tool response ${JSON.stringify(
+                  callingTool
+                )}`
+              );
+            } else {
+              let responsePartData: FunctionResponsePart;
+              if (passContext) {
+                if (!("context" in callingTool)) {
+                  turnToolErrors.push(
+                    `No "context" port in outputs of subgraph "${$board}"`
+                  );
+                  return;
+                }
+                const response = {
+                  ["value"]: JSON.stringify(
+                    callingTool.context as LLMContent[]
+                  ),
+                };
+                responsePartData = {
+                  functionResponse: { name: functionName, response },
+                };
+              } else {
+                responsePartData = {
+                  functionResponse: {
+                    name: functionName,
+                    response: callingTool,
+                  },
+                };
+              }
+              const toolResponseContent: LLMContent = {
+                role: "tool",
+                parts: [responsePartData],
+              };
+              // console.log("Tool execution result for", functionName, ":", toolResponseContent);
+              turnToolResultsLLMContent.push([toolResponseContent]);
+            }
+          }
+        );
+
+        if (turnToolErrors.length && !allowToolErrors) {
+          return err(
+            `Calling tools generated errors: ${turnToolErrors.join(",")}`
+          );
+        }
+        if (turnToolErrors.length && allowToolErrors) {
+          console.warn("Tool errors occurred but are allowed:", turnToolErrors);
+          if (turnToolResultsLLMContent.length === 0) {
+            // console.log("Breaking due to tool errors (allowed) but no successful tool results.");
+            break;
           }
         }
+
+        if (turnToolResultsLLMContent.length > 0) {
+          const mergedToolResponses = mergeLastParts(turnToolResultsLLMContent);
+          currentApiContents = [...currentApiContents, mergedToolResponses];
+          // console.log("Added tool responses to API contents for next iteration.");
+        } else {
+          // console.log("No tool results to send back, breaking sequence.");
+          break;
+        }
+      } else {
+        // console.log("No function call in Gemini response or no ToolManager, sequence ends.");
+        if (validator) {
+          const validating = validator(modelResponsePart);
+          if (!ok(validating)) {
+            console.error(
+              "Validation error on final response:",
+              validating.$error
+            );
+            return validating;
+          }
+        }
+        break;
       }
-    );
-    console.log("ERRORS", errors);
-    if (errors.length && !allowToolErrors) {
+    }
+
+    if (loopIteration >= MAX_SEQUENTIAL_TOOL_CALLS) {
       return err(
-        `Calling tools generated the following errors: ${errors.join(",")}`
+        `Maximum sequential tool call limit (${MAX_SEQUENTIAL_TOOL_CALLS}) reached.`
       );
     }
-    const isJSON =
-      this.inputs.body.generationConfig?.responseMimeType == "application/json";
-    console.log("gemini-prompt before : ", content);
-    const result = isJSON ? [textToJson(content)] : [content];
-    if (results.length) {
-      result.push(mergeLastParts(results));
+
+    if (!finalModelResponseContent) {
+      return err("No final model response content obtained after loop.");
     }
-    console.log("gemini-prompt pushed mergeLastParts: ", result);
-    return { all: result, last: result.at(-1)!, candidate };
+
+    // console.log("gemini-prompt final model content:", finalModelResponseContent);
+    const outputParts =
+      this.inputs.body.generationConfig?.responseMimeType === "application/json"
+        ? [textToJson(finalModelResponseContent)]
+        : [finalModelResponseContent];
+
+    return {
+      all: outputParts,
+      last: outputParts.at(-1)!,
+      candidate: lastCandidate!,
+    };
   }
 }
